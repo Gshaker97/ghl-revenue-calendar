@@ -78,7 +78,7 @@ app.get('/api/calendar',async(req,res)=>{
 
 app.get('/',(req,res)=>{
   res.send(`<!DOCTYPE html>
-<html><head><title>Revenue Calendar - Flexx Landscaping</title>
+<html><head><title>Revenue Calendar - Turf Time</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -130,7 +130,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 </style>
 </head><body>
 <div class="wrap">
-  <div class="hdr"><h1>📅 Revenue Calendar</h1><p>Flexx Landscaping · Knocking &amp; Estimator Pipelines</p></div>
+  <div class="hdr"><h1>📅 Revenue Calendar</h1><p>Turf Time · Knocking&amp; Estimator Pipelines</p></div>
   <div class="controls">
     <button class="nav-btn" onclick="changeMonth(-1)">← Prev</button>
     <div class="month-label" id="monthLabel"></div>
