@@ -8,6 +8,7 @@ const GHL_LOCATION_ID=process.env.GHL_LOCATION_ID||'';
 const ALLOWED_PIPELINE_IDS=['EWGmXwXP63Da5eBMNiDU','jfhZWICxnmISGllte9Rv'];
 const INSTALL_DATE_FIELD_ID='j3gHe7eeXd2yfujzpln8';
 const REVENUE_FIELD_ID='dScpoYWZbeghBsAMBR4o';
+const WEEKLY_CAPACITY=250000;
 const PIPELINE_NAMES={'EWGmXwXP63Da5eBMNiDU':'Knocking Pipeline','jfhZWICxnmISGllte9Rv':'Estimator Pipeline'};
 const STAGE_NAMES={
   '7ee61ae8-7b86-4300-bdf7-d7a0fa4d8471':'Change Order',
@@ -117,6 +118,17 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .revenue-fill{height:100%;border-radius:2px;transition:width .3s}
 .rev-amount{font-size:13px;font-weight:700;margin-bottom:3px}
 .job-count{font-size:11px;color:#666}
+.week-bar-row{grid-column:span 7;background:#0d0d0d;border-bottom:1px solid #1a1a1a;padding:8px 12px;display:flex;align-items:center;gap:12px}
+.week-bar-label{font-size:11px;color:#555;white-space:nowrap;min-width:90px;text-transform:uppercase;letter-spacing:.5px}
+.week-bar-track{flex:1;height:10px;background:#1a1a1a;border-radius:5px;overflow:visible;position:relative}
+.week-bar-fill{height:100%;border-radius:5px;transition:width .4s;min-width:2px;position:relative}
+.week-bar-fill.under{background:linear-gradient(90deg,#2e7d32,#4caf50)}
+.week-bar-fill.over{background:linear-gradient(90deg,#e65100,#ff9800)}
+.week-bar-capacity{position:absolute;right:0;top:-3px;width:2px;height:16px;background:#444;border-radius:1px}
+.week-bar-pct{font-size:12px;font-weight:700;min-width:48px;text-align:right}
+.week-bar-pct.under{color:#4caf50}
+.week-bar-pct.over{color:#ff9800}
+.week-bar-rev{font-size:11px;color:#555;min-width:90px;text-align:right}
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.8);display:none;align-items:center;justify-content:center;z-index:100}
 .modal{background:#141414;border:1px solid #222;border-radius:14px;padding:24px;max-width:500px;width:90%;max-height:80vh;overflow-y:auto}
 .modal h2{font-size:18px;color:#fff;margin-bottom:4px}
@@ -170,6 +182,7 @@ var allData={};
 var currentYear=new Date().getFullYear();
 var currentMonth=new Date().getMonth();
 var maxRev=0;
+var WEEKLY_CAP=250000;
 function fmt(n){return '$'+n.toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0});}
 function getColor(rev){
   if(rev<=0)return null;
@@ -193,6 +206,13 @@ async function loadData(){
     document.getElementById('calGrid').innerHTML='<div class="error-msg" style="grid-column:span 7">Error: '+e.message+'<br><button onclick="loadData()" style="margin-top:12px;background:#1a1a1a;border:1px solid #333;color:#ccc;padding:8px 16px;border-radius:6px;cursor:pointer">Retry</button></div>';
   }
 }
+function getWeekRevenue(weekDates){
+  var total=0;
+  for(var i=0;i<weekDates.length;i++){
+    if(allData[weekDates[i]])total+=allData[weekDates[i]].revenue;
+  }
+  return total;
+}
 function renderCalendar(){
   var months=['January','February','March','April','May','June','July','August','September','October','November','December'];
   document.getElementById('monthLabel').textContent=months[currentMonth]+' '+currentYear;
@@ -203,7 +223,16 @@ function renderCalendar(){
   var grid=document.getElementById('calGrid');
   var html='';
   var monthRev=0,monthJobs=0;
-  for(var i=0;i<startDow;i++)html+='<div class="cell empty"></div>';
+  var weekDates=[];
+  var col=0;
+
+  // padding for first week
+  for(var i=0;i<startDow;i++){
+    html+='<div class="cell empty"></div>';
+    weekDates.push(null);
+    col++;
+  }
+
   for(var d=1;d<=last.getDate();d++){
     var pad=String(d).padStart(2,'0');
     var dateStr=currentYear+'-'+String(currentMonth+1).padStart(2,'0')+'-'+pad;
@@ -211,20 +240,52 @@ function renderCalendar(){
     var isToday=dateStr===today;
     var hasJobs=info&&info.count>0;
     if(hasJobs){monthRev+=info.revenue;monthJobs+=info.count;}
+    weekDates.push(dateStr);
+    col++;
+
     var cls='cell'+(isToday?' today':'')+(hasJobs?' has-jobs':'');
     html+='<div class="'+cls+'"'+(hasJobs?' data-date="'+dateStr+'" onclick="showDay(this.dataset.date)" style="cursor:pointer"':'')+'>'; 
     html+='<div class="day-num">'+d+'</div>';
     if(hasJobs){
       var pct=Math.min(100,Math.round(info.revenue/maxRev*100));
-      var col=getColor(info.revenue);
-      html+='<div class="revenue-bar"><div class="revenue-fill" style="width:'+pct+'%;background:'+col+'"></div></div>';
-      html+='<div class="rev-amount" style="color:'+col+'">'+fmt(info.revenue)+'</div>';
+      var col2=getColor(info.revenue);
+      html+='<div class="revenue-bar"><div class="revenue-fill" style="width:'+pct+'%;background:'+col2+'"></div></div>';
+      html+='<div class="rev-amount" style="color:'+col2+'">'+fmt(info.revenue)+'</div>';
       html+='<div class="job-count">'+info.count+' job'+(info.count!==1?'s':'')+'</div>';
     }
     html+='</div>';
+
+    // end of week row (Saturday) or last day of month
+    if(col===7||d===last.getDate()){
+      // pad remaining days of last partial week
+      if(col<7){
+        for(var p=col;p<7;p++){
+          html+='<div class="cell empty"></div>';
+          weekDates.push(null);
+        }
+      }
+      // render week capacity bar
+      var weekRev=getWeekRevenue(weekDates.filter(function(x){return x!==null;}));
+      var fillPct=Math.min((weekRev/WEEKLY_CAP)*100,100);
+      var isOver=weekRev>WEEKLY_CAP;
+      var overPct=weekRev>0?Math.round(weekRev/WEEKLY_CAP*100):0;
+      var barClass=isOver?'over':'under';
+      html+='<div class="week-bar-row">';
+      html+='<div class="week-bar-label">Week Total</div>';
+      html+='<div class="week-bar-track">';
+      html+='<div class="week-bar-fill '+barClass+'" style="width:'+fillPct+'%">';
+      html+='<div class="week-bar-capacity"></div>';
+      html+='</div>';
+      html+='</div>';
+      html+='<div class="week-bar-pct '+barClass+'">'+overPct+'%</div>';
+      html+='<div class="week-bar-rev">'+fmt(weekRev)+'</div>';
+      html+='</div>';
+
+      weekDates=[];
+      col=0;
+    }
   }
-  var rem=(startDow+last.getDate())%7;
-  if(rem>0)for(var i=rem;i<7;i++)html+='<div class="cell empty"></div>';
+
   grid.innerHTML=html;
   document.getElementById('sumRevenue').textContent=fmt(monthRev);
   document.getElementById('sumJobs').textContent=monthJobs;
