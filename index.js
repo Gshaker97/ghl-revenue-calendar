@@ -1,16 +1,27 @@
-const express=require('express'); const axios=require('axios'); const app=express(); const PORT=process.env.PORT||3000; const GHL_API_KEY=process.env.GHL_API_KEY||''; const GHL_LOCATION_ID=process.env.GHL_LOCATION_ID||'';
+const express=require('express');
+const axios=require('axios');
+const app=express();
+const PORT=process.env.PORT||3000;
+const GHL_API_KEY=process.env.GHL_API_KEY||'';
+const GHL_LOCATION_ID=process.env.GHL_LOCATION_ID||'';
 
 const ALLOWED_PIPELINE_IDS=['EWGmXwXP63Da5eBMNiDU','jfhZWICxnmISGllte9Rv'];
 const INSTALL_DATE_FIELD_ID='j3gHe7eeXd2yfujzpln8';
 const REVENUE_FIELD_ID='dScpoYWZbeghBsAMBR4o';
 const PIPELINE_NAMES={'EWGmXwXP63Da5eBMNiDU':'Knocking Pipeline','jfhZWICxnmISGllte9Rv':'Estimator Pipeline'};
 const STAGE_NAMES={
-  '7ee61ae8-7b86-4300-bdf7-d7a0fa4d8471':'Change Order','7f686159-9e37-4ffb-9311-3f10106cf250':'Closed',
-  '9f6304dd-c1c7-4720-a94b-ccbb6c5bc149':'Scheduled but Unassigned','6f59c233-0909-42bf-88ca-9633201fea4b':'Install Scheduled',
-  '06d6116f-3372-49f1-92ce-07ccb360985c':'Install Complete','865e11ce-f9d3-4632-856a-f4bc98a996a5':'Completed Paid and Unpaid',
-  '04d32879-cd69-4001-8efe-09f2b4675d62':'New Leads','72a74bdf-a2ab-4412-89b0-52142a1e8c0b':'Closed',
-  '04ca42f5-6b23-4d8a-a2fa-3edb9eafe9ba':'Scheduled but Unassigned','4335186c-102f-4d63-99d0-ea6d474b7649':'Scheduled Install',
-  '6852e765-eb65-4a0f-b22e-5c9a63bc803b':'Completed not paid','5038b345-7127-4c9d-8360-93d5b86e9ff7':'Completed and Paid'
+  '7ee61ae8-7b86-4300-bdf7-d7a0fa4d8471':'Change Order',
+  '7f686159-9e37-4ffb-9311-3f10106cf250':'Closed',
+  '9f6304dd-c1c7-4720-a94b-ccbb6c5bc149':'Scheduled but Unassigned',
+  '6f59c233-0909-42bf-88ca-9633201fea4b':'Install Scheduled',
+  '06d6116f-3372-49f1-92ce-07ccb360985c':'Install Complete',
+  '865e11ce-f9d3-4632-856a-f4bc98a996a5':'Completed Paid and Unpaid',
+  '04d32879-cd69-4001-8efe-09f2b4675d62':'New Leads',
+  '72a74bdf-a2ab-4412-89b0-52142a1e8c0b':'Closed',
+  '04ca42f5-6b23-4d8a-a2fa-3edb9eafe9ba':'Scheduled but Unassigned',
+  '4335186c-102f-4d63-99d0-ea6d474b7649':'Scheduled Install',
+  '6852e765-eb65-4a0f-b22e-5c9a63bc803b':'Completed not paid',
+  '5038b345-7127-4c9d-8360-93d5b86e9ff7':'Completed and Paid'
 };
 
 async function getAllOpportunities(){
@@ -155,9 +166,20 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   </div>
 </div>
 <script>
-var allData={};var currentYear=new Date().getFullYear();var currentMonth=new Date().getMonth();var maxRev=0;
-function fmt(n){return'$'+n.toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0});}
-function getColor(rev){if(rev<=0)return null;if(rev<2000)return'#1b5e20';if(rev<5000)return'#2e7d32';if(rev<10000)return'#388e3c';if(rev<20000)return'#43a047';if(rev<40000)return'#4caf50';return'#66bb6a';}
+var allData={};
+var currentYear=new Date().getFullYear();
+var currentMonth=new Date().getMonth();
+var maxRev=0;
+function fmt(n){return '$'+n.toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0});}
+function getColor(rev){
+  if(rev<=0)return null;
+  if(rev<2000)return '#1b5e20';
+  if(rev<5000)return '#2e7d32';
+  if(rev<10000)return '#388e3c';
+  if(rev<20000)return '#43a047';
+  if(rev<40000)return '#4caf50';
+  return '#66bb6a';
+}
 async function loadData(){
   try{
     const r=await fetch('/api/calendar');
@@ -179,7 +201,8 @@ function renderCalendar(){
   var startDow=first.getDay();
   var today=new Date().toISOString().slice(0,10);
   var grid=document.getElementById('calGrid');
-  var html='';var monthRev=0,monthJobs=0;
+  var html='';
+  var monthRev=0,monthJobs=0;
   for(var i=0;i<startDow;i++)html+='<div class="cell empty"></div>';
   for(var d=1;d<=last.getDate();d++){
     var pad=String(d).padStart(2,'0');
@@ -189,7 +212,7 @@ function renderCalendar(){
     var hasJobs=info&&info.count>0;
     if(hasJobs){monthRev+=info.revenue;monthJobs+=info.count;}
     var cls='cell'+(isToday?' today':'')+(hasJobs?' has-jobs':'');
-    html+='<div class="'+cls+'"'+(hasJobs?' onclick="showDay(\''+dateStr+'\')" style="cursor:pointer"':'')+'>'; 
+    html+='<div class="'+cls+'"'+(hasJobs?' data-date="'+dateStr+'" onclick="showDay(this.dataset.date)" style="cursor:pointer"':'')+'>'; 
     html+='<div class="day-num">'+d+'</div>';
     if(hasJobs){
       var pct=Math.min(100,Math.round(info.revenue/maxRev*100));
@@ -214,7 +237,8 @@ function changeMonth(dir){
   renderCalendar();
 }
 function showDay(dateStr){
-  var info=allData[dateStr];if(!info)return;
+  var info=allData[dateStr];
+  if(!info)return;
   var d=new Date(dateStr+'T12:00:00');
   var opts={weekday:'long',year:'numeric',month:'long',day:'numeric'};
   document.getElementById('modalDate').textContent=d.toLocaleDateString('en-US',opts);
@@ -223,9 +247,11 @@ function showDay(dateStr){
   var jobsHtml='';
   var sorted=info.jobs.slice().sort((a,b)=>b.revenue-a.revenue);
   for(var j of sorted){
-    jobsHtml+='<div class="job-item"><div class="job-name">'+j.name+'</div>';
+    jobsHtml+='<div class="job-item">';
+    jobsHtml+='<div class="job-name">'+j.name+'</div>';
     jobsHtml+='<div class="job-meta">'+j.pipeline+(j.stage?' · '+j.stage:'')+'</div>';
-    jobsHtml+='<div class="job-rev">'+fmt(j.revenue)+'</div></div>';
+    jobsHtml+='<div class="job-rev">'+fmt(j.revenue)+'</div>';
+    jobsHtml+='</div>';
   }
   document.getElementById('modalJobs').innerHTML=jobsHtml;
   document.getElementById('modalOverlay').style.display='flex';
