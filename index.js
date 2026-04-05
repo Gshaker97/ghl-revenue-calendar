@@ -25,8 +25,14 @@ const STAGE_NAMES={
   '5038b345-7127-4c9d-8360-93d5b86e9ff7':'Completed and Paid'
 };
 
-// Day job capacity limits (0=Sun,1=Mon,2=Tue,3=Wed,4=Thu,5=Fri,6=Sat)
-const DAY_JOB_LIMIT={1:7,2:4,3:5,4:5,5:3};// Mon=7,Tue=4,Wed=5,Thu=5,Fri=3; Sat/Sun no limit
+const CREW_CALENDAR_IDS={
+  'Cody':'YwDVLD5gSqcTws1JFL40',
+  'Kevin':'bLgQlUtXaEn8NUbCgLWf',
+  'Joel':'kffGMRfcVPuoLPnh6lVe',
+  'Scott':'sfqmiQ2hETw51PYCWw2f'
+};
+
+const DAY_LIMITS={1:7,2:4,3:5,4:5,5:3};
 
 async function getAllOpportunities(){
   let all=[],page=1,hasMore=true;
@@ -43,6 +49,41 @@ async function getAllOpportunities(){
     }catch(e){console.error('GHL API error:',e.response?.data||e.message);hasMore=false;}
   }
   return all;
+}
+
+async function getCalendarAppointments(calendarId,crewName){
+  const appointments=[];
+  try{
+    const startTime=new Date();
+    startTime.setMonth(startTime.getMonth()-6);
+    const endTime=new Date();
+    endTime.setMonth(endTime.getMonth()+6);
+    let page=1,hasMore=true;
+    while(hasMore){
+      const r=await axios.get('https://services.leadconnectorhq.com/calendars/events',{
+        headers:{Authorization:'Bearer '+GHL_API_KEY,Version:'2021-07-28'},
+        params:{
+          locationId:GHL_LOCATION_ID,
+          calendarId,
+          startTime:startTime.toISOString(),
+          endTime:endTime.toISOString(),
+          limit:100,
+          page
+        }
+      });
+      const events=r.data?.events||r.data?.appointments||[];
+      for(const ev of events){
+        const start=ev.startTime||ev.start||ev.appointmentDate||null;
+        if(!start)continue;
+        const date=new Date(start).toISOString().slice(0,10);
+        const title=ev.title||ev.contactName||ev.name||'Unknown';
+        appointments.push({date,name:title,crew:crewName,id:ev.id||ev._id||null});
+      }
+      hasMore=events.length===100;
+      page++;
+    }
+  }catch(e){console.error('Calendar API error for '+crewName+':',e.response?.data||e.message);}
+  return appointments;
 }
 
 function getInstallDate(opp){
@@ -67,10 +108,21 @@ function getRevenue(opp){
   return parseFloat(opp.monetaryValue||opp.value||0)||0;
 }
 
+function normalizeName(name){
+  if(!name)return '';
+  return name.toLowerCase().replace(/[^a-z0-9]/g,'').trim();
+}
+
 app.get('/api/calendar',async(req,res)=>{
   try{
     const opps=await getAllOpportunities();
+
+    const calendarPromises=Object.entries(CREW_CALENDAR_IDS).map(([crew,id])=>getCalendarAppointments(id,crew));
+    const calendarResults=await Promise.all(calendarPromises);
+    const allAppointments=calendarResults.flat();
+
     const byDate={};
+
     for(const opp of opps){
       if(!ALLOWED_PIPELINE_IDS.includes(opp.pipelineId))continue;
       const date=getInstallDate(opp);
@@ -78,13 +130,39 @@ app.get('/api/calendar',async(req,res)=>{
       const revenue=getRevenue(opp);
       const pipelineName=PIPELINE_NAMES[opp.pipelineId]||opp.pipelineId;
       const stageName=STAGE_NAMES[opp.pipelineStageId]||opp.pipelineStageId||'';
+      const name=opp.name||opp.contact?.name||'Unknown';
       if(!byDate[date])byDate[date]={date,revenue:0,jobs:[],count:0};
       byDate[date].revenue+=revenue;
       byDate[date].count++;
-      byDate[date].jobs.push({name:opp.name||opp.contact?.name||'Unknown',revenue,pipeline:pipelineName,stage:stageName});
+      byDate[date].jobs.push({
+        name,revenue,
+        pending:revenue<=0,
+        pipeline:pipelineName,
+        stage:stageName,
+        source:'opportunity',
+        normalizedName:normalizeName(name)
+      });
     }
+
+    for(const appt of allAppointments){
+      const {date,name,crew}=appt;
+      const normalizedAppt=normalizeName(name);
+      if(!byDate[date])byDate[date]={date,revenue:0,jobs:[],count:0};
+      const isDuplicate=byDate[date].jobs.some(j=>j.normalizedName===normalizedAppt);
+      if(isDuplicate)continue;
+      byDate[date].count++;
+      byDate[date].jobs.push({
+        name,revenue:0,
+        pending:true,
+        pipeline:'Crew Calendar',
+        stage:crew,
+        source:'calendar',
+        normalizedName:normalizedAppt
+      });
+    }
+
     res.json({success:true,data:Object.values(byDate).sort((a,b)=>a.date.localeCompare(b.date))});
-  }catch(e){res.status(500).json({error:e.message});}
+  }catch(e){console.error(e);res.status(500).json({error:e.message});}
 });
 
 app.get('/',(req,res)=>{
@@ -110,21 +188,25 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .dow-header{display:grid;grid-template-columns:repeat(6,1fr) 90px;background:#141414;border-bottom:1px solid #1a1a1a}
 .dow{padding:10px;text-align:center;font-size:11px;font-weight:600;color:#555;text-transform:uppercase;letter-spacing:.5px}
 .grid{display:grid;grid-template-columns:repeat(6,1fr) 90px}
-.week-row{display:contents}
 .cell{min-height:110px;padding:8px;border-right:1px solid #161616;border-bottom:1px solid #161616;transition:background .15s;position:relative}
 .cell:hover{background:#181818}
 .cell.empty{background:#0d0d0d;cursor:default}
 .cell.today{border:2px solid #4caf50}
+.cell.day-warn{background:rgba(234,179,8,0.07)}
+.cell.day-warn::after{content:'';position:absolute;inset:0;background:rgba(234,179,8,0.11);pointer-events:none}
 .cell.full{background:rgba(220,38,38,0.08)}
-.cell.full::after{content:'';position:absolute;inset:0;background:rgba(220,38,38,0.13);pointer-events:none;border-radius:0}
+.cell.full::after{content:'';position:absolute;inset:0;background:rgba(220,38,38,0.13);pointer-events:none}
 .day-num{font-size:12px;color:#444;margin-bottom:6px;font-weight:600}
 .cell.today .day-num{color:#4caf50}
 .cell.has-jobs .day-num{color:#ccc}
 .cell.full .day-num{color:#f87171}
+.cell.day-warn .day-num{color:#fde047}
 .full-badge{display:inline-block;font-size:9px;font-weight:700;color:#f87171;background:rgba(220,38,38,0.18);border:1px solid rgba(220,38,38,0.3);border-radius:4px;padding:1px 5px;margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px}
+.warn-badge{display:inline-block;font-size:9px;font-weight:700;color:#fde047;background:rgba(234,179,8,0.15);border:1px solid rgba(234,179,8,0.35);border-radius:4px;padding:1px 5px;margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px}
 .revenue-bar{width:100%;height:4px;border-radius:2px;margin-bottom:6px;background:#1a1a1a}
 .revenue-fill{height:100%;border-radius:2px;transition:width .3s}
 .rev-amount{font-size:13px;font-weight:700;margin-bottom:3px}
+.rev-pending{font-size:11px;font-weight:600;color:#f59e0b;margin-bottom:3px}
 .job-count{font-size:11px;color:#666}
 .week-bar-cell{min-height:110px;border-bottom:1px solid #161616;background:#0d0d0d;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:8px 6px;position:relative;gap:6px}
 .week-bar-cell.week-full{background:rgba(220,38,38,0.08)}
@@ -137,7 +219,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .week-bar-pct{font-size:11px;font-weight:700}
 .week-bar-pct.under{color:#4caf50}
 .week-bar-pct.over{color:#ff9800}
-.week-bar-rev{font-size:9px;color:#555;text-align:center;line-height:1.4}
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.8);display:none;align-items:center;justify-content:center;z-index:100}
 .modal{background:#141414;border:1px solid #222;border-radius:14px;padding:24px;max-width:500px;width:90%;max-height:80vh;overflow-y:auto}
 .modal h2{font-size:18px;color:#fff;margin-bottom:4px}
@@ -146,19 +227,22 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .modal-total .t-val{font-size:22px;font-weight:700;color:#4caf50}
 .modal-total .t-lbl{font-size:11px;color:#2e7d32;text-transform:uppercase}
 .job-item{background:#1a1a1a;border:1px solid #222;border-radius:8px;padding:12px;margin-bottom:8px}
+.job-item.is-pending{border-color:#3a2e00}
 .job-name{font-size:14px;font-weight:600;color:#fff;margin-bottom:4px}
 .job-meta{font-size:12px;color:#666}
 .job-rev{font-size:14px;font-weight:700;color:#4caf50;float:right;margin-top:-20px}
+.job-rev.pending{color:#f59e0b;font-size:12px;font-weight:600}
 .close-btn{background:#1a1a1a;border:1px solid #333;color:#aaa;padding:8px 18px;border-radius:8px;cursor:pointer;font-size:13px;margin-top:16px;width:100%}
 .close-btn:hover{background:#222;color:#fff}
 .loading{text-align:center;padding:60px;color:#444}
 .spinner{width:32px;height:32px;border:3px solid #1a1a1a;border-top-color:#4caf50;border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 16px}
 @keyframes spin{to{transform:rotate(360deg)}}
 .error-msg{text-align:center;padding:40px;color:#f44336}
+.refresh-note{text-align:center;font-size:11px;color:#333;margin-top:12px}
 </style>
 </head><body>
 <div class="wrap">
-<div class="hdr"><h1>📅 Revenue Calendar</h1><p>Turf Time · Knocking &amp; Estimator Pipelines</p></div>
+<div class="hdr"><h1>📅 Revenue Calendar</h1><p>Turf Time · Pipelines + Kevin, Cody, Joel &amp; Scott</p></div>
 <div class="controls">
   <button class="nav-btn" onclick="changeMonth(-1)">← Prev</button>
   <div class="month-label" id="monthLabel"></div>
@@ -177,12 +261,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   </div>
   <div class="grid" id="calGrid"><div class="loading" style="grid-column:span 7"><div class="spinner"></div>Loading jobs...</div></div>
 </div>
+<div class="refresh-note" id="refreshNote">Refreshes every 30 minutes</div>
 </div>
 <div class="modal-overlay" id="modalOverlay" onclick="closeModal(event)">
   <div class="modal">
     <h2 id="modalDate"></h2>
     <div class="date-sub" id="modalSub"></div>
-    <div class="modal-total"><div class="t-val" id="modalTotal"></div><div class="t-lbl">Total Revenue</div></div>
+    <div class="modal-total"><div class="t-val" id="modalTotal"></div><div class="t-lbl">Total Confirmed Revenue</div></div>
     <div id="modalJobs"></div>
     <button class="close-btn" onclick="closeModal()">Close</button>
   </div>
@@ -194,6 +279,7 @@ var currentMonth=new Date().getMonth();
 var maxRev=0;
 var WEEKLY_CAP=250000;
 var DAY_LIMITS={1:7,2:4,3:5,4:5,5:3};
+var lastLoaded=null;
 
 function fmt(n){return '$'+n.toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0});}
 function fmtK(n){return n>=1000?'$'+(n/1000).toFixed(0)+'k':fmt(n);}
@@ -206,6 +292,7 @@ function getColor(rev){
   if(rev<40000)return '#4caf50';
   return '#66bb6a';
 }
+
 async function loadData(){
   try{
     const r=await fetch('/api/calendar');
@@ -214,26 +301,32 @@ async function loadData(){
     allData={};
     for(const item of d.data){allData[item.date]=item;}
     maxRev=Math.max(...d.data.map(x=>x.revenue),1);
+    lastLoaded=new Date();
+    updateRefreshNote();
     renderCalendar();
   }catch(e){
     document.getElementById('calGrid').innerHTML='<div class="error-msg" style="grid-column:span 7">Error: '+e.message+'<br><button onclick="loadData()" style="margin-top:12px;background:#1a1a1a;border:1px solid #333;color:#ccc;padding:8px 16px;border-radius:6px;cursor:pointer">Retry</button></div>';
   }
 }
 
-function isDayFull(dateStr){
-  var d=new Date(dateStr+'T12:00:00');
-  var dow=d.getDay();
-  var limit=DAY_LIMITS[dow];
-  if(!limit)return false;
-  var info=allData[dateStr];
-  if(!info)return false;
-  return info.count>=limit;
+function updateRefreshNote(){
+  if(!lastLoaded)return;
+  var t=lastLoaded.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
+  document.getElementById('refreshNote').textContent='Last updated: '+t+' · Refreshes every 30 min';
 }
 
 function getDayLimit(dateStr){
-  var d=new Date(dateStr+'T12:00:00');
-  var dow=d.getDay();
+  var dow=new Date(dateStr+'T12:00:00').getDay();
   return DAY_LIMITS[dow]||null;
+}
+
+function getDayStatus(dateStr){
+  var limit=getDayLimit(dateStr);
+  if(!limit)return null;
+  var count=(allData[dateStr]?allData[dateStr].count:0);
+  if(count>=limit)return 'full';
+  if(count===limit-1)return 'warn';
+  return null;
 }
 
 function renderCalendar(){
@@ -245,17 +338,18 @@ function renderCalendar(){
   var grid=document.getElementById('calGrid');
   var html='';
   var monthRev=0,monthJobs=0;
+
   var firstDow=first.getDay();
   var monOffset=(firstDow===0)?6:firstDow-1;
   var slots=[];
   for(var i=0;i<monOffset;i++)slots.push(null);
   for(var d2=1;d2<=last.getDate();d2++){
     var ds=currentYear+'-'+String(currentMonth+1).padStart(2,'0')+'-'+String(d2).padStart(2,'0');
-    var dow2=new Date(ds+'T12:00:00').getDay();
-    if(dow2===0)continue;
+    if(new Date(ds+'T12:00:00').getDay()===0)continue;
     slots.push(ds);
   }
   while(slots.length%6!==0)slots.push(null);
+
   var numWeeks=slots.length/6;
   for(var w=0;w<numWeeks;w++){
     var weekSlots=slots.slice(w*6,(w+1)*6);
@@ -265,6 +359,7 @@ function renderCalendar(){
       if(allData[weekDates[i2]])weekRev+=allData[weekDates[i2]].revenue;
     }
     var weekFull=weekRev>=WEEKLY_CAP;
+
     for(var s=0;s<6;s++){
       var dateStr=weekSlots[s];
       if(!dateStr){
@@ -274,39 +369,48 @@ function renderCalendar(){
       var info=allData[dateStr];
       var isToday=dateStr===today;
       var hasJobs=info&&info.count>0;
-      var dayFull=isDayFull(dateStr);
+      var dayStatus=getDayStatus(dateStr);
       var limit=getDayLimit(dateStr);
       if(hasJobs){monthRev+=info.revenue;monthJobs+=info.count;}
+
       var cls='cell';
       if(isToday)cls+=' today';
       if(hasJobs)cls+=' has-jobs';
-      if(dayFull||weekFull)cls+=' full';
+      if(dayStatus==='full'||weekFull)cls+=' full';
+      else if(dayStatus==='warn')cls+=' day-warn';
+
       html+='<div class="'+cls+'"'+(hasJobs?' data-date="'+dateStr+'" onclick="showDay(this.dataset.date)" style="cursor:pointer"':'')+' data-date="'+dateStr+'">';
       html+='<div class="day-num">'+parseInt(dateStr.slice(8))+'</div>';
-      if(dayFull){html+='<div class="full-badge">Full</div>';}
+      if(dayStatus==='full'){html+='<div class="full-badge">Full</div>';}
+      else if(dayStatus==='warn'){html+='<div class="warn-badge">1 Left</div>';}
+
       if(hasJobs){
-        var pct=Math.min(100,Math.round(info.revenue/maxRev*100));
-        var col2=getColor(info.revenue);
-        html+='<div class="revenue-bar"><div class="revenue-fill" style="width:'+pct+'%;background:'+col2+'"></div></div>';
-        html+='<div class="rev-amount" style="color:'+col2+'">'+fmt(info.revenue)+'</div>';
+        var hasPending=info.jobs.some(function(j){return j.pending;});
+        if(info.revenue>0){
+          var pct=Math.min(100,Math.round(info.revenue/maxRev*100));
+          var col2=getColor(info.revenue);
+          html+='<div class="revenue-bar"><div class="revenue-fill" style="width:'+pct+'%;background:'+col2+'"></div></div>';
+          html+='<div class="rev-amount" style="color:'+col2+'">'+fmt(info.revenue)+'</div>';
+        }
+        if(hasPending){html+='<div class="rev-pending">+ Pending</div>';}
         var countLabel=info.count+' job'+(info.count!==1?'s':'');
         if(limit)countLabel+=' / '+limit;
         html+='<div class="job-count">'+countLabel+'</div>';
       }
       html+='</div>';
     }
+
     var fillPct=Math.min((weekRev/WEEKLY_CAP)*100,100);
     var isOver=weekRev>WEEKLY_CAP;
     var overPct=weekRev>0?Math.round(weekRev/WEEKLY_CAP*100):0;
     var barClass=isOver?'over':'under';
     html+='<div class="week-bar-cell'+(weekFull?' week-full':'')+'">';
     html+='<div class="week-bar-title">Week<br>'+fmtK(weekRev)+'</div>';
-    html+='<div class="week-bar-track">';
-    html+='<div class="week-bar-fill '+barClass+'" style="height:'+fillPct+'%"></div>';
-    html+='</div>';
+    html+='<div class="week-bar-track"><div class="week-bar-fill '+barClass+'" style="height:'+fillPct+'%"></div></div>';
     html+='<div class="week-bar-pct '+barClass+'">'+overPct+'%</div>';
     html+='</div>';
   }
+
   grid.innerHTML=html;
   document.getElementById('sumRevenue').textContent=fmt(monthRev);
   document.getElementById('sumJobs').textContent=monthJobs;
@@ -319,6 +423,7 @@ function changeMonth(dir){
   if(currentMonth<0){currentMonth=11;currentYear--;}
   renderCalendar();
 }
+
 function showDay(dateStr){
   var info=allData[dateStr];
   if(!info)return;
@@ -333,8 +438,8 @@ function showDay(dateStr){
   var jobsHtml='';
   var sorted=info.jobs.slice().sort((a,b)=>b.revenue-a.revenue);
   for(var j of sorted){
-    jobsHtml+='<div class="job-item">';
-    jobsHtml+='<div class="job-rev">'+fmt(j.revenue)+'</div>';
+    jobsHtml+='<div class="job-item'+(j.pending?' is-pending':'')+'">';
+    jobsHtml+='<div class="job-rev '+(j.pending?'pending':'')+'">'+( j.pending?'Pending Revenue':fmt(j.revenue))+'</div>';
     jobsHtml+='<div class="job-name">'+j.name+'</div>';
     jobsHtml+='<div class="job-meta">'+j.pipeline+(j.stage?' · '+j.stage:'')+'</div>';
     jobsHtml+='</div>';
@@ -342,12 +447,14 @@ function showDay(dateStr){
   document.getElementById('modalJobs').innerHTML=jobsHtml;
   document.getElementById('modalOverlay').style.display='flex';
 }
+
 function closeModal(e){
   if(!e||e.target===document.getElementById('modalOverlay'))
     document.getElementById('modalOverlay').style.display='none';
 }
+
 loadData();
-setInterval(loadData,5*60*1000);
+setInterval(loadData,30*60*1000);
 </script>
 </body></html>`);
 });
