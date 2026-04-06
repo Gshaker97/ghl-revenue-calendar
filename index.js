@@ -33,6 +33,7 @@ const CREW_CALENDAR_IDS={
 const DAY_LIMITS={1:7,2:4,3:5,4:5,5:3};
 const OPP_INSTALL_DATE_ID='j3gHe7eeXd2yfujzpln8';
 const OPP_PRICE_ID='dScpoYWZbeghBsAMBR4o';
+const ALLOWED_STAGE_IDS=['9f6304dd-c1c7-4720-a94b-ccbb6c5bc149','04ca42f5-6b23-4d8a-a2fa-3edb9eafe9ba','6f59c233-0909-42bf-88ca-9633201fea4b','4335186c-102f-4d63-99d0-ea6d474b7649'];
 
 function getFieldById(fields,id){
   if(!fields||!fields.length)return null;
@@ -158,7 +159,7 @@ async function getCalendarAppointments(calendarId,crewName){
 app.get('/api/calendar',async(req,res)=>{
   try{
     const opps=await getAllOpportunities();
-    const relevantOpps=opps.filter(o=>ALLOWED_PIPELINE_IDS.includes(o.pipelineId));
+    const relevantOpps=opps.filter(o=>ALLOWED_PIPELINE_IDS.includes(o.pipelineId)&&ALLOWED_STAGE_IDS.includes(o.pipelineStageId));
 
     const BATCH=10;
     const contactMap={};
@@ -233,7 +234,6 @@ app.get('/api/calendar',async(req,res)=>{
   }catch(e){console.error(e);res.status(500).json({error:e.message});}
 });
 
-// DEBUG: finds first 3 opps in allowed pipelines and shows all raw field data
 app.get('/api/debug',async(req,res)=>{
   try{
     let found=[];
@@ -246,7 +246,7 @@ app.get('/api/debug',async(req,res)=>{
       const opps=r.data?.opportunities||[];
       if(!opps.length)break;
       for(const o of opps){
-        if(ALLOWED_PIPELINE_IDS.includes(o.pipelineId))found.push(o);
+        if(ALLOWED_PIPELINE_IDS.includes(o.pipelineId)&&ALLOWED_STAGE_IDS.includes(o.pipelineStageId))found.push(o);
         if(found.length>=3)break;
       }
       page++;
@@ -257,6 +257,7 @@ app.get('/api/debug',async(req,res)=>{
       return{
         name:o.name,
         pipelineId:o.pipelineId,
+        stageId:o.pipelineStageId,
         contactId,
         monetaryValue:o.monetaryValue,
         assignedTo:o.assignedTo,
