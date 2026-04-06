@@ -31,30 +31,36 @@ const CREW_CALENDAR_IDS={
 };
 
 const DAY_LIMITS={1:7,2:4,3:5,4:5,5:3};
-
-// Field IDs
 const OPP_INSTALL_DATE_ID='j3gHe7eeXd2yfujzpln8';
 const OPP_PRICE_ID='dScpoYWZbeghBsAMBR4o';
 
-function getFieldById(fields, id){
+function getFieldById(fields,id){
   if(!fields||!fields.length)return null;
   for(const f of fields){
-    if(f.id===id){
+    if(f.id===id) return f.fieldValueDate||f.fieldValueNumber||f.fieldValue||f.value||null;
+  }
+  return null;
+}
+
+function getFieldByKeyName(fields,keyFragment){
+  if(!fields||!fields.length)return null;
+  for(const f of fields){
+    const k=(f.fieldKey||f.key||f.id||'').toLowerCase();
+    if(k===keyFragment||k.includes(keyFragment)){
       return f.fieldValueDate||f.fieldValueNumber||f.fieldValue||f.value||null;
     }
   }
   return null;
 }
 
-// Search fields by partial key match (for contact fields which use key names)
-function getFieldByKeyName(fields, keyFragment){
-  if(!fields||!fields.length)return null;
-  for(const f of fields){
-    const k=f.fieldKey||f.key||f.id||'';
-    if(k===keyFragment||k.includes(keyFragment)){
-      return f.fieldValueDate||f.fieldValueNumber||f.fieldValue||f.value||null;
-    }
+function getSalesRep(oppFields,contactFields,opp){
+  const keys=['sales_rep','salesrep','sales rep','rep','assigned_to'];
+  for(const k of keys){
+    let v=getFieldByKeyName(oppFields,k)||getFieldByKeyName(contactFields,k);
+    if(v) return String(v);
   }
+  if(opp.assignedTo) return opp.assignedTo;
+  if(opp.user) return opp.user.name||opp.user.firstName||null;
   return null;
 }
 
@@ -70,29 +76,24 @@ function parseDate(val){
   return isNaN(d.getTime())?null:d.toISOString().slice(0,10);
 }
 
-function getInstallDate(oppFields, contactFields){
-  // Try opportunity install date field ID first
-  let val=getFieldById(oppFields, OPP_INSTALL_DATE_ID);
+function getInstallDate(oppFields,contactFields){
+  let val=getFieldById(oppFields,OPP_INSTALL_DATE_ID);
   if(!val) val=getFieldByKeyName(oppFields,'install_date');
-  // Fall back to contact fields
   if(!val) val=getFieldByKeyName(contactFields,'install_date');
   return parseDate(val);
 }
 
-function getRevenue(oppFields, contactFields, monetaryValue){
-  // Try opportunity price field ID first
-  let val=getFieldById(oppFields, OPP_PRICE_ID);
+function getRevenue(oppFields,contactFields,monetaryValue){
+  let val=getFieldById(oppFields,OPP_PRICE_ID);
   if(val!==null&&val!==undefined){
     const n=parseFloat(String(val).replace(/[^0-9.]/g,''));
-    if(!isNaN(n)&&n>0)return n;
+    if(!isNaN(n)&&n>0) return n;
   }
-  // Try contact job_price by key
   val=getFieldByKeyName(contactFields,'job_price');
   if(val!==null&&val!==undefined){
     const n=parseFloat(String(val).replace(/[^0-9.]/g,''));
-    if(!isNaN(n)&&n>0)return n;
+    if(!isNaN(n)&&n>0) return n;
   }
-  // Fall back to GHL monetary value
   return parseFloat(monetaryValue||0)||0;
 }
 
@@ -131,24 +132,13 @@ async function getContact(contactId){
 async function getCalendarAppointments(calendarId,crewName){
   const appointments=[];
   try{
-    const startTime=new Date();
-    startTime.setMonth(startTime.getMonth()-6);
-    const endTime=new Date();
-    endTime.setMonth(endTime.getMonth()+6);
-    const startMs=startTime.getTime();
-    const endMs=endTime.getTime();
+    const startTime=new Date();startTime.setMonth(startTime.getMonth()-6);
+    const endTime=new Date();endTime.setMonth(endTime.getMonth()+6);
     let page=1,hasMore=true;
     while(hasMore){
       const r=await axios.get('https://services.leadconnectorhq.com/calendars/events',{
         headers:{Authorization:'Bearer '+GHL_API_KEY,Version:'2021-07-28'},
-        params:{
-          locationId:GHL_LOCATION_ID,
-          calendarId,
-          startTime:startMs,
-          endTime:endMs,
-          limit:100,
-          page
-        }
+        params:{locationId:GHL_LOCATION_ID,calendarId,startTime:startTime.getTime(),endTime:endTime.getTime(),limit:100,page}
       });
       const events=r.data?.events||r.data?.appointments||[];
       for(const ev of events){
@@ -168,11 +158,8 @@ async function getCalendarAppointments(calendarId,crewName){
 app.get('/api/calendar',async(req,res)=>{
   try{
     const opps=await getAllOpportunities();
-
-    // Filter to allowed pipelines first to avoid fetching contacts for unrelated opps
     const relevantOpps=opps.filter(o=>ALLOWED_PIPELINE_IDS.includes(o.pipelineId));
 
-    // Fetch all contacts in parallel (batch to avoid rate limits)
     const BATCH=10;
     const contactMap={};
     for(let i=0;i<relevantOpps.length;i+=BATCH){
@@ -189,26 +176,30 @@ app.get('/api/calendar',async(req,res)=>{
     const allAppointments=calendarResults.flat();
 
     const byDate={};
+    const noDateList=[];
 
     for(const opp of relevantOpps){
       const oppFields=opp.customFields||[];
       const contactId=opp.contactId||opp.contact?.id;
       const contact=contactMap[contactId]||null;
       const contactFields=contact?.customFields||[];
-
       const date=getInstallDate(oppFields,contactFields);
-      if(!date)continue;
-
       const revenue=getRevenue(oppFields,contactFields,opp.monetaryValue||opp.value);
       const pipelineName=PIPELINE_NAMES[opp.pipelineId]||opp.pipelineId;
       const stageName=STAGE_NAMES[opp.pipelineStageId]||opp.pipelineStageId||'';
-      const name=opp.name||opp.contact?.name||contact?.firstName+' '+contact?.lastName||'Unknown';
+      const name=opp.name||opp.contact?.name||'Unknown';
+      const salesRep=getSalesRep(oppFields,contactFields,opp);
+
+      if(!date){
+        noDateList.push({name,revenue,pipeline:pipelineName,stage:stageName,salesRep});
+        continue;
+      }
 
       if(!byDate[date])byDate[date]={date,revenue:0,jobs:[],count:0};
       byDate[date].revenue+=revenue;
       byDate[date].count++;
       byDate[date].jobs.push({
-        name,revenue,
+        name,revenue,salesRep,
         pending:revenue<=0,
         pipeline:pipelineName,
         stage:stageName,
@@ -225,7 +216,7 @@ app.get('/api/calendar',async(req,res)=>{
       if(isDuplicate)continue;
       byDate[date].count++;
       byDate[date].jobs.push({
-        name,revenue:0,
+        name,revenue:0,salesRep:crew,
         pending:true,
         pipeline:'Crew Calendar',
         stage:crew,
@@ -234,19 +225,33 @@ app.get('/api/calendar',async(req,res)=>{
       });
     }
 
-    res.json({success:true,data:Object.values(byDate).sort((a,b)=>a.date.localeCompare(b.date))});
+    res.json({
+      success:true,
+      data:Object.values(byDate).sort((a,b)=>a.date.localeCompare(b.date)),
+      noDateList:noDateList.sort((a,b)=>b.revenue-a.revenue)
+    });
   }catch(e){console.error(e);res.status(500).json({error:e.message});}
 });
 
-// DEBUG: visit /api/debug to see raw fields for first 3 opps including contact fields
+// DEBUG: finds first 3 opps in allowed pipelines and shows all raw field data
 app.get('/api/debug',async(req,res)=>{
   try{
-    const r=await axios.get('https://services.leadconnectorhq.com/opportunities/search',{
-      headers:{Authorization:'Bearer '+GHL_API_KEY,Version:'2021-07-28'},
-      params:{location_id:GHL_LOCATION_ID,limit:3,page:1,status:'open'}
-    });
-    const opps=r.data?.opportunities||[];
-    const result=await Promise.all(opps.map(async o=>{
+    let found=[];
+    let page=1;
+    while(found.length<3){
+      const r=await axios.get('https://services.leadconnectorhq.com/opportunities/search',{
+        headers:{Authorization:'Bearer '+GHL_API_KEY,Version:'2021-07-28'},
+        params:{location_id:GHL_LOCATION_ID,limit:100,page,status:'open'}
+      });
+      const opps=r.data?.opportunities||[];
+      if(!opps.length)break;
+      for(const o of opps){
+        if(ALLOWED_PIPELINE_IDS.includes(o.pipelineId))found.push(o);
+        if(found.length>=3)break;
+      }
+      page++;
+    }
+    const result=await Promise.all(found.map(async o=>{
       const contactId=o.contactId||o.contact?.id;
       const contact=await getContact(contactId);
       return{
@@ -254,8 +259,10 @@ app.get('/api/debug',async(req,res)=>{
         pipelineId:o.pipelineId,
         contactId,
         monetaryValue:o.monetaryValue,
+        assignedTo:o.assignedTo,
         oppCustomFields:o.customFields,
-        contactCustomFields:contact?.customFields
+        contactCustomFields:contact?.customFields||null,
+        contactKeys:contact?Object.keys(contact):null
       };
     }));
     res.json(result);
@@ -325,7 +332,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .modal-total .t-lbl{font-size:11px;color:#2e7d32;text-transform:uppercase}
 .job-item{background:#1a1a1a;border:1px solid #222;border-radius:8px;padding:12px;margin-bottom:8px}
 .job-item.is-pending{border-color:#3a2e00}
-.job-name{font-size:14px;font-weight:600;color:#fff;margin-bottom:4px}
+.job-name{font-size:14px;font-weight:600;color:#fff;margin-bottom:3px}
+.job-sales-rep{font-size:11px;color:#888;margin-bottom:4px}
 .job-meta{font-size:12px;color:#666}
 .job-rev{font-size:14px;font-weight:700;color:#4caf50;float:right;margin-top:-20px}
 .job-rev.pending{color:#f59e0b;font-size:12px;font-weight:600}
@@ -336,6 +344,21 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 @keyframes spin{to{transform:rotate(360deg)}}
 .error-msg{text-align:center;padding:40px;color:#f44336}
 .refresh-note{text-align:center;font-size:11px;color:#333;margin-top:12px}
+.no-date-section{margin-top:40px;background:#111;border:1px solid #1a1a1a;border-radius:14px;overflow:hidden}
+.no-date-header{background:#141414;padding:16px 20px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #1a1a1a}
+.no-date-header h2{font-size:16px;font-weight:700;color:#f59e0b}
+.no-date-count{font-size:12px;color:#555;background:#1a1a1a;padding:3px 10px;border-radius:20px}
+.no-date-table{width:100%;border-collapse:collapse}
+.no-date-table th{padding:10px 16px;text-align:left;font-size:10px;font-weight:700;color:#444;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid #1a1a1a}
+.no-date-table td{padding:12px 16px;font-size:13px;border-bottom:1px solid #161616}
+.no-date-table tr:last-child td{border-bottom:none}
+.no-date-table tr:hover td{background:#161616}
+.no-date-name{font-weight:600;color:#e0e0e0}
+.no-date-rev{font-weight:700;color:#4caf50}
+.no-date-rev.zero{color:#555}
+.no-date-rep{color:#888}
+.no-date-pipeline{font-size:11px;color:#555}
+.no-date-stage{display:inline-block;font-size:10px;padding:2px 7px;border-radius:4px;background:#1a1a1a;color:#666;margin-top:2px}
 </style>
 </head><body>
 <div class="wrap">
@@ -359,6 +382,25 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   <div class="grid" id="calGrid"><div class="loading" style="grid-column:span 7"><div class="spinner"></div>Loading jobs...</div></div>
 </div>
 <div class="refresh-note" id="refreshNote">Refreshes every 30 minutes</div>
+
+<div class="no-date-section" id="noDateSection" style="display:none">
+  <div class="no-date-header">
+    <h2>⚠️ Missing Install Date</h2>
+    <span class="no-date-count" id="noDateCount">0 jobs</span>
+  </div>
+  <table class="no-date-table">
+    <thead>
+      <tr>
+        <th>Customer</th>
+        <th>Revenue</th>
+        <th>Sales Rep</th>
+        <th>Pipeline / Stage</th>
+      </tr>
+    </thead>
+    <tbody id="noDateBody"></tbody>
+  </table>
+</div>
+
 </div>
 <div class="modal-overlay" id="modalOverlay" onclick="closeModal(event)">
   <div class="modal">
@@ -371,6 +413,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 </div>
 <script>
 var allData={};
+var noDateData=[];
 var currentYear=new Date().getFullYear();
 var currentMonth=new Date().getMonth();
 var maxRev=0;
@@ -398,12 +441,33 @@ async function loadData(){
     allData={};
     for(const item of d.data){allData[item.date]=item;}
     maxRev=Math.max(...d.data.map(x=>x.revenue),1);
+    noDateData=d.noDateList||[];
     lastLoaded=new Date();
     updateRefreshNote();
     renderCalendar();
+    renderNoDateList();
   }catch(e){
     document.getElementById('calGrid').innerHTML='<div class="error-msg" style="grid-column:span 7">Error: '+e.message+'<br><button onclick="loadData()" style="margin-top:12px;background:#1a1a1a;border:1px solid #333;color:#ccc;padding:8px 16px;border-radius:6px;cursor:pointer">Retry</button></div>';
   }
+}
+
+function renderNoDateList(){
+  var section=document.getElementById('noDateSection');
+  var body=document.getElementById('noDateBody');
+  var count=document.getElementById('noDateCount');
+  if(!noDateData.length){section.style.display='none';return;}
+  section.style.display='block';
+  count.textContent=noDateData.length+' job'+(noDateData.length!==1?'s':'');
+  var html='';
+  for(var j of noDateData){
+    html+='<tr>';
+    html+='<td><div class="no-date-name">'+j.name+'</div></td>';
+    html+='<td><span class="no-date-rev'+(j.revenue<=0?' zero':'')+'">'+( j.revenue>0?fmt(j.revenue):'—')+'</span></td>';
+    html+='<td><span class="no-date-rep">'+(j.salesRep||'—')+'</span></td>';
+    html+='<td><div class="no-date-pipeline">'+j.pipeline+'</div><div class="no-date-stage">'+j.stage+'</div></td>';
+    html+='</tr>';
+  }
+  body.innerHTML=html;
 }
 
 function updateRefreshNote(){
@@ -459,10 +523,7 @@ function renderCalendar(){
 
     for(var s=0;s<6;s++){
       var dateStr=weekSlots[s];
-      if(!dateStr){
-        html+='<div class="cell empty'+(weekFull?' full':'')+'"></div>';
-        continue;
-      }
+      if(!dateStr){html+='<div class="cell empty'+(weekFull?' full':'')+'"></div>';continue;}
       var info=allData[dateStr];
       var isToday=dateStr===today;
       var hasJobs=info&&info.count>0;
@@ -538,6 +599,7 @@ function showDay(dateStr){
     jobsHtml+='<div class="job-item'+(j.pending?' is-pending':'')+'">';
     jobsHtml+='<div class="job-rev '+(j.pending?'pending':'')+'">'+( j.pending?'Pending Revenue':fmt(j.revenue))+'</div>';
     jobsHtml+='<div class="job-name">'+j.name+'</div>';
+    if(j.salesRep){jobsHtml+='<div class="job-sales-rep">👤 '+j.salesRep+'</div>';}
     jobsHtml+='<div class="job-meta">'+j.pipeline+(j.stage?' · '+j.stage:'')+'</div>';
     jobsHtml+='</div>';
   }
