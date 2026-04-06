@@ -180,6 +180,24 @@ app.get('/api/calendar',async(req,res)=>{
   }catch(e){console.error(e);res.status(500).json({error:e.message});}
 });
 
+// DEBUG: visit /api/debug to see raw custom field structure from GHL
+app.get('/api/debug',async(req,res)=>{
+  try{
+    const r=await axios.get('https://services.leadconnectorhq.com/opportunities/search',{
+      headers:{Authorization:'Bearer '+GHL_API_KEY,Version:'2021-07-28'},
+      params:{location_id:GHL_LOCATION_ID,limit:3,page:1,status:'open'}
+    });
+    const opps=r.data?.opportunities||[];
+    const result=opps.map(o=>({
+      name:o.name,
+      pipelineId:o.pipelineId,
+      monetaryValue:o.monetaryValue,
+      customFields:o.customFields
+    }));
+    res.json(result);
+  }catch(e){res.status(500).json({error:e.message,detail:e.response?.data});}
+});
+
 app.get('/',(req,res)=>{
   res.send(`<!DOCTYPE html>
 <html><head><title>Revenue Calendar - Turf Time</title>
