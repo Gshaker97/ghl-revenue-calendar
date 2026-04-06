@@ -6,8 +6,6 @@ const GHL_API_KEY=process.env.GHL_API_KEY||'';
 const GHL_LOCATION_ID=process.env.GHL_LOCATION_ID||'';
 
 const ALLOWED_PIPELINE_IDS=['EWGmXwXP63Da5eBMNiDU','jfhZWICxnmISGllte9Rv'];
-const INSTALL_DATE_FIELD_ID='j3gHe7eeXd2yfujzpln8';
-const REVENUE_FIELD_ID='dScpoYWZbeghBsAMBR4o';
 const WEEKLY_CAPACITY=250000;
 const PIPELINE_NAMES={'EWGmXwXP63Da5eBMNiDU':'Knocking Pipeline','jfhZWICxnmISGllte9Rv':'Estimator Pipeline'};
 const STAGE_NAMES={
@@ -34,6 +32,50 @@ const CREW_CALENDAR_IDS={
 
 const DAY_LIMITS={1:7,2:4,3:5,4:5,5:3};
 
+function getFieldByKey(fields,key){
+  if(!fields||!fields.length)return null;
+  for(const f of fields){
+    const k=f.fieldKey||f.key||f.name||'';
+    if(k===key||k.endsWith('.'+key.split('.').pop())){
+      return f.fieldValue||f.value||f.fieldValueDate||f.fieldValueNumber||null;
+    }
+  }
+  return null;
+}
+
+function parseDate(val){
+  if(!val)return null;
+  const str=String(val).trim();
+  if(/^\d+$/.test(str)){
+    const ts=parseInt(str);
+    const d=new Date(ts>9999999999?ts:ts*1000);
+    return isNaN(d.getTime())?null:d.toISOString().slice(0,10);
+  }
+  const d=new Date(str);
+  return isNaN(d.getTime())?null:d.toISOString().slice(0,10);
+}
+
+function getInstallDate(opp){
+  const fields=opp.customFields||[];
+  const val=getFieldByKey(fields,'opportunity.install_date')||getFieldByKey(fields,'contact.install_date');
+  return parseDate(val);
+}
+
+function getRevenue(opp){
+  const fields=opp.customFields||[];
+  const val=getFieldByKey(fields,'opportunity.price')||getFieldByKey(fields,'contact.job_price');
+  if(val!==null&&val!==undefined){
+    const n=parseFloat(String(val).replace(/[^0-9.]/g,''));
+    if(!isNaN(n))return n;
+  }
+  return parseFloat(opp.monetaryValue||opp.value||0)||0;
+}
+
+function normalizeName(name){
+  if(!name)return '';
+  return name.toLowerCase().replace(/[^a-z0-9]/g,'').trim();
+}
+
 async function getAllOpportunities(){
   let all=[],page=1,hasMore=true;
   while(hasMore){
@@ -58,6 +100,8 @@ async function getCalendarAppointments(calendarId,crewName){
     startTime.setMonth(startTime.getMonth()-6);
     const endTime=new Date();
     endTime.setMonth(endTime.getMonth()+6);
+    const startMs=startTime.getTime();
+    const endMs=endTime.getTime();
     let page=1,hasMore=true;
     while(hasMore){
       const r=await axios.get('https://services.leadconnectorhq.com/calendars/events',{
@@ -65,8 +109,8 @@ async function getCalendarAppointments(calendarId,crewName){
         params:{
           locationId:GHL_LOCATION_ID,
           calendarId,
-          startTime:startTime.toISOString(),
-          endTime:endTime.toISOString(),
+          startTime:startMs,
+          endTime:endMs,
           limit:100,
           page
         }
@@ -86,41 +130,12 @@ async function getCalendarAppointments(calendarId,crewName){
   return appointments;
 }
 
-function getInstallDate(opp){
-  const fields=opp.customFields||[];
-  for(const f of fields){
-    if(f.id===INSTALL_DATE_FIELD_ID){
-      const val=f.fieldValueDate||f.value||null;
-      if(!val)return null;
-      const ts=parseInt(val);
-      const d=new Date(ts>9999999999?ts:ts*1000);
-      return isNaN(d)?null:d.toISOString().slice(0,10);
-    }
-  }
-  return null;
-}
-
-function getRevenue(opp){
-  const fields=opp.customFields||[];
-  for(const f of fields){
-    if(f.id===REVENUE_FIELD_ID){return parseFloat(f.fieldValueNumber||0)||0;}
-  }
-  return parseFloat(opp.monetaryValue||opp.value||0)||0;
-}
-
-function normalizeName(name){
-  if(!name)return '';
-  return name.toLowerCase().replace(/[^a-z0-9]/g,'').trim();
-}
-
 app.get('/api/calendar',async(req,res)=>{
   try{
     const opps=await getAllOpportunities();
-
     const calendarPromises=Object.entries(CREW_CALENDAR_IDS).map(([crew,id])=>getCalendarAppointments(id,crew));
     const calendarResults=await Promise.all(calendarPromises);
     const allAppointments=calendarResults.flat();
-
     const byDate={};
 
     for(const opp of opps){
