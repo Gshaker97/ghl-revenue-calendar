@@ -32,12 +32,27 @@ const CREW_CALENDAR_IDS={
 
 const DAY_LIMITS={1:7,2:4,3:5,4:5,5:3};
 
-function getFieldByKey(fields,key){
+// Field IDs
+const OPP_INSTALL_DATE_ID='j3gHe7eeXd2yfujzpln8';
+const OPP_PRICE_ID='dScpoYWZbeghBsAMBR4o';
+
+function getFieldById(fields, id){
   if(!fields||!fields.length)return null;
   for(const f of fields){
-    const k=f.fieldKey||f.key||f.name||'';
-    if(k===key||k.endsWith('.'+key.split('.').pop())){
-      return f.fieldValue||f.value||f.fieldValueDate||f.fieldValueNumber||null;
+    if(f.id===id){
+      return f.fieldValueDate||f.fieldValueNumber||f.fieldValue||f.value||null;
+    }
+  }
+  return null;
+}
+
+// Search fields by partial key match (for contact fields which use key names)
+function getFieldByKeyName(fields, keyFragment){
+  if(!fields||!fields.length)return null;
+  for(const f of fields){
+    const k=f.fieldKey||f.key||f.id||'';
+    if(k===keyFragment||k.includes(keyFragment)){
+      return f.fieldValueDate||f.fieldValueNumber||f.fieldValue||f.value||null;
     }
   }
   return null;
@@ -55,20 +70,30 @@ function parseDate(val){
   return isNaN(d.getTime())?null:d.toISOString().slice(0,10);
 }
 
-function getInstallDate(opp){
-  const fields=opp.customFields||[];
-  const val=getFieldByKey(fields,'opportunity.install_date')||getFieldByKey(fields,'contact.install_date');
+function getInstallDate(oppFields, contactFields){
+  // Try opportunity install date field ID first
+  let val=getFieldById(oppFields, OPP_INSTALL_DATE_ID);
+  if(!val) val=getFieldByKeyName(oppFields,'install_date');
+  // Fall back to contact fields
+  if(!val) val=getFieldByKeyName(contactFields,'install_date');
   return parseDate(val);
 }
 
-function getRevenue(opp){
-  const fields=opp.customFields||[];
-  const val=getFieldByKey(fields,'opportunity.price')||getFieldByKey(fields,'contact.job_price');
+function getRevenue(oppFields, contactFields, monetaryValue){
+  // Try opportunity price field ID first
+  let val=getFieldById(oppFields, OPP_PRICE_ID);
   if(val!==null&&val!==undefined){
     const n=parseFloat(String(val).replace(/[^0-9.]/g,''));
-    if(!isNaN(n))return n;
+    if(!isNaN(n)&&n>0)return n;
   }
-  return parseFloat(opp.monetaryValue||opp.value||0)||0;
+  // Try contact job_price by key
+  val=getFieldByKeyName(contactFields,'job_price');
+  if(val!==null&&val!==undefined){
+    const n=parseFloat(String(val).replace(/[^0-9.]/g,''));
+    if(!isNaN(n)&&n>0)return n;
+  }
+  // Fall back to GHL monetary value
+  return parseFloat(monetaryValue||0)||0;
 }
 
 function normalizeName(name){
@@ -91,6 +116,16 @@ async function getAllOpportunities(){
     }catch(e){console.error('GHL API error:',e.response?.data||e.message);hasMore=false;}
   }
   return all;
+}
+
+async function getContact(contactId){
+  if(!contactId)return null;
+  try{
+    const r=await axios.get('https://services.leadconnectorhq.com/contacts/'+contactId,{
+      headers:{Authorization:'Bearer '+GHL_API_KEY,Version:'2021-07-28'}
+    });
+    return r.data?.contact||r.data||null;
+  }catch(e){console.error('Contact fetch error:',e.response?.data||e.message);return null;}
 }
 
 async function getCalendarAppointments(calendarId,crewName){
@@ -133,19 +168,42 @@ async function getCalendarAppointments(calendarId,crewName){
 app.get('/api/calendar',async(req,res)=>{
   try{
     const opps=await getAllOpportunities();
+
+    // Filter to allowed pipelines first to avoid fetching contacts for unrelated opps
+    const relevantOpps=opps.filter(o=>ALLOWED_PIPELINE_IDS.includes(o.pipelineId));
+
+    // Fetch all contacts in parallel (batch to avoid rate limits)
+    const BATCH=10;
+    const contactMap={};
+    for(let i=0;i<relevantOpps.length;i+=BATCH){
+      const batch=relevantOpps.slice(i,i+BATCH);
+      const results=await Promise.all(batch.map(o=>getContact(o.contactId||o.contact?.id)));
+      batch.forEach((o,idx)=>{
+        const cid=o.contactId||o.contact?.id;
+        if(cid&&results[idx])contactMap[cid]=results[idx];
+      });
+    }
+
     const calendarPromises=Object.entries(CREW_CALENDAR_IDS).map(([crew,id])=>getCalendarAppointments(id,crew));
     const calendarResults=await Promise.all(calendarPromises);
     const allAppointments=calendarResults.flat();
+
     const byDate={};
 
-    for(const opp of opps){
-      if(!ALLOWED_PIPELINE_IDS.includes(opp.pipelineId))continue;
-      const date=getInstallDate(opp);
+    for(const opp of relevantOpps){
+      const oppFields=opp.customFields||[];
+      const contactId=opp.contactId||opp.contact?.id;
+      const contact=contactMap[contactId]||null;
+      const contactFields=contact?.customFields||[];
+
+      const date=getInstallDate(oppFields,contactFields);
       if(!date)continue;
-      const revenue=getRevenue(opp);
+
+      const revenue=getRevenue(oppFields,contactFields,opp.monetaryValue||opp.value);
       const pipelineName=PIPELINE_NAMES[opp.pipelineId]||opp.pipelineId;
       const stageName=STAGE_NAMES[opp.pipelineStageId]||opp.pipelineStageId||'';
-      const name=opp.name||opp.contact?.name||'Unknown';
+      const name=opp.name||opp.contact?.name||contact?.firstName+' '+contact?.lastName||'Unknown';
+
       if(!byDate[date])byDate[date]={date,revenue:0,jobs:[],count:0};
       byDate[date].revenue+=revenue;
       byDate[date].count++;
@@ -180,7 +238,7 @@ app.get('/api/calendar',async(req,res)=>{
   }catch(e){console.error(e);res.status(500).json({error:e.message});}
 });
 
-// DEBUG: visit /api/debug to see raw custom field structure from GHL
+// DEBUG: visit /api/debug to see raw fields for first 3 opps including contact fields
 app.get('/api/debug',async(req,res)=>{
   try{
     const r=await axios.get('https://services.leadconnectorhq.com/opportunities/search',{
@@ -188,11 +246,17 @@ app.get('/api/debug',async(req,res)=>{
       params:{location_id:GHL_LOCATION_ID,limit:3,page:1,status:'open'}
     });
     const opps=r.data?.opportunities||[];
-    const result=opps.map(o=>({
-      name:o.name,
-      pipelineId:o.pipelineId,
-      monetaryValue:o.monetaryValue,
-      customFields:o.customFields
+    const result=await Promise.all(opps.map(async o=>{
+      const contactId=o.contactId||o.contact?.id;
+      const contact=await getContact(contactId);
+      return{
+        name:o.name,
+        pipelineId:o.pipelineId,
+        contactId,
+        monetaryValue:o.monetaryValue,
+        oppCustomFields:o.customFields,
+        contactCustomFields:contact?.customFields
+      };
     }));
     res.json(result);
   }catch(e){res.status(500).json({error:e.message,detail:e.response?.data});}
