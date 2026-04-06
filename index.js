@@ -33,7 +33,38 @@ const CREW_CALENDAR_IDS={
 const DAY_LIMITS={1:7,2:4,3:5,4:5,5:3};
 const OPP_INSTALL_DATE_ID='j3gHe7eeXd2yfujzpln8';
 const OPP_PRICE_ID='dScpoYWZbeghBsAMBR4o';
-const ALLOWED_STAGE_IDS=['9f6304dd-c1c7-4720-a94b-ccbb6c5bc149','04ca42f5-6b23-4d8a-a2fa-3edb9eafe9ba','6f59c233-0909-42bf-88ca-9633201fea4b','4335186c-102f-4d63-99d0-ea6d474b7649'];
+const ALLOWED_STAGE_IDS=[
+  '9f6304dd-c1c7-4720-a94b-ccbb6c5bc149',
+  '04ca42f5-6b23-4d8a-a2fa-3edb9eafe9ba',
+  '6f59c233-0909-42bf-88ca-9633201fea4b',
+  '4335186c-102f-4d63-99d0-ea6d474b7649'
+];
+
+// Cache for user ID -> name lookups
+let userCache={};
+
+function getFirstName(name){
+  if(!name)return '';
+  // Strip trailing ".." or "..." and get first word
+  return name.replace(/\.+$/,'').trim().split(/\s+/)[0].toLowerCase().replace(/[^a-z0-9]/g,'');
+}
+
+function normalizeName(name){
+  if(!name)return '';
+  return name.toLowerCase().replace(/[^a-z0-9]/g,'').trim();
+}
+
+// Match by first name - handles truncated calendar names like "Mirna .."
+function namesMatch(oppName,calName){
+  if(!oppName||!calName)return false;
+  const oppFull=normalizeName(oppName);
+  const calFull=normalizeName(calName.replace(/\.+$/,''));
+  if(oppFull===calFull)return true;
+  // Match if calendar name is start of opp name (truncated)
+  const oppFirst=getFirstName(oppName);
+  const calFirst=getFirstName(calName);
+  return oppFirst.length>2&&calFirst.length>2&&(oppFirst===calFirst||oppFull.startsWith(calFull)||calFull.startsWith(oppFirst));
+}
 
 function getFieldById(fields,id){
   if(!fields||!fields.length)return null;
@@ -54,13 +85,32 @@ function getFieldByKeyName(fields,keyFragment){
   return null;
 }
 
-function getSalesRep(oppFields,contactFields,opp){
+async function resolveUserId(userId){
+  if(!userId)return null;
+  // Return if it looks like a real name already (has a space or is short)
+  if(userId.includes(' ')||userId.length<20)return userId;
+  if(userCache[userId])return userCache[userId];
+  try{
+    const r=await axios.get('https://services.leadconnectorhq.com/users/'+userId,{
+      headers:{Authorization:'Bearer '+GHL_API_KEY,Version:'2021-07-28'}
+    });
+    const u=r.data?.user||r.data;
+    const name=[u?.firstName,u?.lastName].filter(Boolean).join(' ')||u?.name||userId;
+    userCache[userId]=name;
+    return name;
+  }catch(e){
+    userCache[userId]=userId;
+    return userId;
+  }
+}
+
+async function getSalesRep(oppFields,contactFields,opp){
   const keys=['sales_rep','salesrep','sales rep','rep','assigned_to'];
   for(const k of keys){
     let v=getFieldByKeyName(oppFields,k)||getFieldByKeyName(contactFields,k);
-    if(v) return String(v);
+    if(v) return await resolveUserId(String(v));
   }
-  if(opp.assignedTo) return opp.assignedTo;
+  if(opp.assignedTo) return await resolveUserId(opp.assignedTo);
   if(opp.user) return opp.user.name||opp.user.firstName||null;
   return null;
 }
@@ -98,11 +148,6 @@ function getRevenue(oppFields,contactFields,monetaryValue){
   return parseFloat(monetaryValue||0)||0;
 }
 
-function normalizeName(name){
-  if(!name)return '';
-  return name.toLowerCase().replace(/[^a-z0-9]/g,'').trim();
-}
-
 async function getAllOpportunities(){
   let all=[],page=1,hasMore=true;
   while(hasMore){
@@ -127,7 +172,7 @@ async function getContact(contactId){
       headers:{Authorization:'Bearer '+GHL_API_KEY,Version:'2021-07-28'}
     });
     return r.data?.contact||r.data||null;
-  }catch(e){console.error('Contact fetch error:',e.response?.data||e.message);return null;}
+  }catch(e){return null;}
 }
 
 async function getCalendarAppointments(calendarId,crewName){
@@ -161,6 +206,7 @@ app.get('/api/calendar',async(req,res)=>{
     const opps=await getAllOpportunities();
     const relevantOpps=opps.filter(o=>ALLOWED_PIPELINE_IDS.includes(o.pipelineId)&&ALLOWED_STAGE_IDS.includes(o.pipelineStageId));
 
+    // Fetch contacts in batches
     const BATCH=10;
     const contactMap={};
     for(let i=0;i<relevantOpps.length;i+=BATCH){
@@ -172,6 +218,7 @@ app.get('/api/calendar',async(req,res)=>{
       });
     }
 
+    // Fetch all crew calendar appointments
     const calendarPromises=Object.entries(CREW_CALENDAR_IDS).map(([crew,id])=>getCalendarAppointments(id,crew));
     const calendarResults=await Promise.all(calendarPromises);
     const allAppointments=calendarResults.flat();
@@ -179,6 +226,7 @@ app.get('/api/calendar',async(req,res)=>{
     const byDate={};
     const noDateList=[];
 
+    // Process opportunities
     for(const opp of relevantOpps){
       const oppFields=opp.customFields||[];
       const contactId=opp.contactId||opp.contact?.id;
@@ -189,10 +237,35 @@ app.get('/api/calendar',async(req,res)=>{
       const pipelineName=PIPELINE_NAMES[opp.pipelineId]||opp.pipelineId;
       const stageName=STAGE_NAMES[opp.pipelineStageId]||opp.pipelineStageId||'';
       const name=opp.name||opp.contact?.name||'Unknown';
-      const salesRep=getSalesRep(oppFields,contactFields,opp);
+      const salesRep=await getSalesRep(oppFields,contactFields,opp);
 
       if(!date){
-        noDateList.push({name,revenue,pipeline:pipelineName,stage:stageName,salesRep});
+        // Check if this opp matches a calendar appointment — if so, use that date
+        let calDate=null;
+        let calCrew=null;
+        for(const appt of allAppointments){
+          if(namesMatch(name,appt.name)){
+            calDate=appt.date;
+            calCrew=appt.crew;
+            break;
+          }
+        }
+        if(calDate){
+          // Found a matching calendar appointment — use that date
+          if(!byDate[calDate])byDate[calDate]={date:calDate,revenue:0,jobs:[],count:0};
+          byDate[calDate].revenue+=revenue;
+          byDate[calDate].count++;
+          byDate[calDate].jobs.push({
+            name,revenue,salesRep,
+            pending:revenue<=0,
+            pipeline:pipelineName,
+            stage:stageName,
+            source:'calendar-matched',
+            normalizedName:normalizeName(name)
+          });
+        }else{
+          noDateList.push({name,revenue,pipeline:pipelineName,stage:stageName,salesRep});
+        }
         continue;
       }
 
@@ -209,12 +282,13 @@ app.get('/api/calendar',async(req,res)=>{
       });
     }
 
+    // Add calendar appointments that have no matching opportunity at all
     for(const appt of allAppointments){
       const {date,name,crew}=appt;
-      const normalizedAppt=normalizeName(name);
-      if(!byDate[date])byDate[date]={date,revenue:0,jobs:[],count:0};
-      const isDuplicate=byDate[date].jobs.some(j=>j.normalizedName===normalizedAppt);
-      if(isDuplicate)continue;
+      if(!byDate[date]){byDate[date]={date,revenue:0,jobs:[],count:0};}
+      // Check if already covered by an opportunity (by name match)
+      const alreadyExists=byDate[date].jobs.some(j=>namesMatch(j.name,name));
+      if(alreadyExists)continue;
       byDate[date].count++;
       byDate[date].jobs.push({
         name,revenue:0,salesRep:crew,
@@ -222,7 +296,7 @@ app.get('/api/calendar',async(req,res)=>{
         pipeline:'Crew Calendar',
         stage:crew,
         source:'calendar',
-        normalizedName:normalizedAppt
+        normalizedName:normalizeName(name)
       });
     }
 
@@ -234,6 +308,7 @@ app.get('/api/calendar',async(req,res)=>{
   }catch(e){console.error(e);res.status(500).json({error:e.message});}
 });
 
+// DEBUG endpoint
 app.get('/api/debug',async(req,res)=>{
   try{
     let found=[];
@@ -254,6 +329,7 @@ app.get('/api/debug',async(req,res)=>{
     const result=await Promise.all(found.map(async o=>{
       const contactId=o.contactId||o.contact?.id;
       const contact=await getContact(contactId);
+      const salesRep=await getSalesRep(o.customFields||[],contact?.customFields||[],o);
       return{
         name:o.name,
         pipelineId:o.pipelineId,
@@ -261,6 +337,7 @@ app.get('/api/debug',async(req,res)=>{
         contactId,
         monetaryValue:o.monetaryValue,
         assignedTo:o.assignedTo,
+        resolvedSalesRep:salesRep,
         oppCustomFields:o.customFields,
         contactCustomFields:contact?.customFields||null,
         contactKeys:contact?Object.keys(contact):null
