@@ -43,9 +43,12 @@ const ALLOWED_STAGE_IDS=[
 // Cache for user ID -> name lookups
 let userCache={};
 
+// Cache for full calendar response
+let calendarCache={data:null,timestamp:0};
+const CACHE_TTL=5*60*1000; // 5 minutes
+
 function getFirstName(name){
   if(!name)return '';
-  // Strip trailing ".." or "..." and get first word
   return name.replace(/\.+$/,'').trim().split(/\s+/)[0].toLowerCase().replace(/[^a-z0-9]/g,'');
 }
 
@@ -54,13 +57,11 @@ function normalizeName(name){
   return name.toLowerCase().replace(/[^a-z0-9]/g,'').trim();
 }
 
-// Match by first name - handles truncated calendar names like "Mirna .."
 function namesMatch(oppName,calName){
   if(!oppName||!calName)return false;
   const oppFull=normalizeName(oppName);
   const calFull=normalizeName(calName.replace(/\.+$/,''));
   if(oppFull===calFull)return true;
-  // Match if calendar name is start of opp name (truncated)
   const oppFirst=getFirstName(oppName);
   const calFirst=getFirstName(calName);
   return oppFirst.length>2&&calFirst.length>2&&(oppFirst===calFirst||oppFull.startsWith(calFull)||calFull.startsWith(oppFirst));
@@ -85,9 +86,23 @@ function getFieldByKeyName(fields,keyFragment){
   return null;
 }
 
+// Pre-fetch all users in one call and cache them
+async function prefetchAllUsers(){
+  try{
+    const r=await axios.get('https://services.leadconnectorhq.com/users/',{
+      headers:{Authorization:'Bearer '+GHL_API_KEY,Version:'2021-07-28'},
+      params:{locationId:GHL_LOCATION_ID}
+    });
+    const users=r.data?.users||[];
+    for(const u of users){
+      const name=[u.firstName,u.lastName].filter(Boolean).join(' ')||u.name||u.id;
+      userCache[u.id]=name;
+    }
+  }catch(e){console.error('User prefetch error:',e.response?.data||e.message);}
+}
+
 async function resolveUserId(userId){
   if(!userId)return null;
-  // Return if it looks like a real name already (has a space or is short)
   if(userId.includes(' ')||userId.length<20)return userId;
   if(userCache[userId])return userCache[userId];
   try{
@@ -148,19 +163,33 @@ function getRevenue(oppFields,contactFields,monetaryValue){
   return parseFloat(monetaryValue||0)||0;
 }
 
+// Fetch a single page of opportunities
+async function getOpportunityPage(page){
+  try{
+    const r=await axios.get('https://services.leadconnectorhq.com/opportunities/search',{
+      headers:{Authorization:'Bearer '+GHL_API_KEY,Version:'2021-07-28'},
+      params:{location_id:GHL_LOCATION_ID,limit:100,page,status:'open'}
+    });
+    return r.data?.opportunities||[];
+  }catch(e){console.error('GHL API error page '+page+':',e.response?.data||e.message);return [];}
+}
+
+// Pull pages in parallel batches
 async function getAllOpportunities(){
-  let all=[],page=1,hasMore=true;
-  while(hasMore){
-    try{
-      const r=await axios.get('https://services.leadconnectorhq.com/opportunities/search',{
-        headers:{Authorization:'Bearer '+GHL_API_KEY,Version:'2021-07-28'},
-        params:{location_id:GHL_LOCATION_ID,limit:100,page,status:'open'}
-      });
-      const ops=r.data?.opportunities||[];
-      all=all.concat(ops);
-      hasMore=ops.length===100;
-      page++;
-    }catch(e){console.error('GHL API error:',e.response?.data||e.message);hasMore=false;}
+  let all=[];
+  let page=1;
+  const BATCH_SIZE=4;
+  let keepGoing=true;
+  while(keepGoing){
+    const pagePromises=[];
+    for(let i=0;i<BATCH_SIZE;i++){
+      pagePromises.push(getOpportunityPage(page+i));
+    }
+    const results=await Promise.all(pagePromises);
+    for(const ops of results){all=all.concat(ops);}
+    const anyShort=results.some(ops=>ops.length<100);
+    if(anyShort)keepGoing=false;
+    page+=BATCH_SIZE;
   }
   return all;
 }
@@ -201,111 +230,161 @@ async function getCalendarAppointments(calendarId,crewName){
   return appointments;
 }
 
+// Build the full calendar response (the expensive part)
+async function buildCalendarData(){
+  // Prefetch users + opportunities + calendars all in parallel
+  const [_,opps,calendarResults]=await Promise.all([
+    prefetchAllUsers(),
+    getAllOpportunities(),
+    Promise.all(Object.entries(CREW_CALENDAR_IDS).map(([crew,id])=>getCalendarAppointments(id,crew)))
+  ]);
+
+  const relevantOpps=opps.filter(o=>ALLOWED_PIPELINE_IDS.includes(o.pipelineId)&&ALLOWED_STAGE_IDS.includes(o.pipelineStageId));
+
+  // Fetch contacts in larger parallel batches
+  const BATCH=25;
+  const contactMap={};
+  for(let i=0;i<relevantOpps.length;i+=BATCH){
+    const batch=relevantOpps.slice(i,i+BATCH);
+    const results=await Promise.all(batch.map(o=>getContact(o.contactId||o.contact?.id)));
+    batch.forEach((o,idx)=>{
+      const cid=o.contactId||o.contact?.id;
+      if(cid&&results[idx])contactMap[cid]=results[idx];
+    });
+  }
+
+  const allAppointments=calendarResults.flat();
+
+  // Resolve sales reps in parallel
+  const salesReps=await Promise.all(relevantOpps.map(opp=>{
+    const oppFields=opp.customFields||[];
+    const contactId=opp.contactId||opp.contact?.id;
+    const contact=contactMap[contactId]||null;
+    const contactFields=contact?.customFields||[];
+    return getSalesRep(oppFields,contactFields,opp);
+  }));
+
+  const byDate={};
+  const noDateList=[];
+
+  for(let i=0;i<relevantOpps.length;i++){
+    const opp=relevantOpps[i];
+    const oppFields=opp.customFields||[];
+    const contactId=opp.contactId||opp.contact?.id;
+    const contact=contactMap[contactId]||null;
+    const contactFields=contact?.customFields||[];
+    const date=getInstallDate(oppFields,contactFields);
+    const revenue=getRevenue(oppFields,contactFields,opp.monetaryValue||opp.value);
+    const pipelineName=PIPELINE_NAMES[opp.pipelineId]||opp.pipelineId;
+    const stageName=STAGE_NAMES[opp.pipelineStageId]||opp.pipelineStageId||'';
+    const name=opp.name||opp.contact?.name||'Unknown';
+    const salesRep=salesReps[i];
+
+    if(!date){
+      let calDate=null;
+      let calCrew=null;
+      for(const appt of allAppointments){
+        if(namesMatch(name,appt.name)){
+          calDate=appt.date;
+          calCrew=appt.crew;
+          break;
+        }
+      }
+      if(calDate){
+        if(!byDate[calDate])byDate[calDate]={date:calDate,revenue:0,jobs:[],count:0};
+        byDate[calDate].revenue+=revenue;
+        byDate[calDate].count++;
+        byDate[calDate].jobs.push({
+          name,revenue,salesRep,
+          pending:revenue<=0,
+          pipeline:pipelineName,
+          stage:stageName,
+          source:'calendar-matched',
+          normalizedName:normalizeName(name)
+        });
+      }else{
+        noDateList.push({name,revenue,pipeline:pipelineName,stage:stageName,salesRep});
+      }
+      continue;
+    }
+
+    if(!byDate[date])byDate[date]={date,revenue:0,jobs:[],count:0};
+    byDate[date].revenue+=revenue;
+    byDate[date].count++;
+    byDate[date].jobs.push({
+      name,revenue,salesRep,
+      pending:revenue<=0,
+      pipeline:pipelineName,
+      stage:stageName,
+      source:'opportunity',
+      normalizedName:normalizeName(name)
+    });
+  }
+
+  for(const appt of allAppointments){
+    const {date,name,crew}=appt;
+    if(!byDate[date]){byDate[date]={date,revenue:0,jobs:[],count:0};}
+    const alreadyExists=byDate[date].jobs.some(j=>namesMatch(j.name,name));
+    if(alreadyExists)continue;
+    byDate[date].count++;
+    byDate[date].jobs.push({
+      name,revenue:0,salesRep:crew,
+      pending:true,
+      pipeline:'Crew Calendar',
+      stage:crew,
+      source:'calendar',
+      normalizedName:normalizeName(name)
+    });
+  }
+
+  return {
+    success:true,
+    data:Object.values(byDate).sort((a,b)=>a.date.localeCompare(b.date)),
+    noDateList:noDateList.sort((a,b)=>b.revenue-a.revenue)
+  };
+}
+
+// Background refresh function — runs without blocking response
+async function refreshCacheInBackground(){
+  try{
+    const data=await buildCalendarData();
+    calendarCache={data,timestamp:Date.now()};
+    console.log('Cache refreshed at '+new Date().toISOString());
+  }catch(e){console.error('Background refresh error:',e.message);}
+}
+
 app.get('/api/calendar',async(req,res)=>{
   try{
-    const opps=await getAllOpportunities();
-    const relevantOpps=opps.filter(o=>ALLOWED_PIPELINE_IDS.includes(o.pipelineId)&&ALLOWED_STAGE_IDS.includes(o.pipelineStageId));
+    const now=Date.now();
+    const age=now-calendarCache.timestamp;
+    const force=req.query.refresh==='1';
 
-    // Fetch contacts in batches
-    const BATCH=10;
-    const contactMap={};
-    for(let i=0;i<relevantOpps.length;i+=BATCH){
-      const batch=relevantOpps.slice(i,i+BATCH);
-      const results=await Promise.all(batch.map(o=>getContact(o.contactId||o.contact?.id)));
-      batch.forEach((o,idx)=>{
-        const cid=o.contactId||o.contact?.id;
-        if(cid&&results[idx])contactMap[cid]=results[idx];
-      });
+    // If cache is fresh, return it instantly
+    if(!force&&calendarCache.data&&age<CACHE_TTL){
+      return res.json({...calendarCache.data,cached:true,cacheAgeSec:Math.round(age/1000)});
     }
 
-    // Fetch all crew calendar appointments
-    const calendarPromises=Object.entries(CREW_CALENDAR_IDS).map(([crew,id])=>getCalendarAppointments(id,crew));
-    const calendarResults=await Promise.all(calendarPromises);
-    const allAppointments=calendarResults.flat();
-
-    const byDate={};
-    const noDateList=[];
-
-    // Process opportunities
-    for(const opp of relevantOpps){
-      const oppFields=opp.customFields||[];
-      const contactId=opp.contactId||opp.contact?.id;
-      const contact=contactMap[contactId]||null;
-      const contactFields=contact?.customFields||[];
-      const date=getInstallDate(oppFields,contactFields);
-      const revenue=getRevenue(oppFields,contactFields,opp.monetaryValue||opp.value);
-      const pipelineName=PIPELINE_NAMES[opp.pipelineId]||opp.pipelineId;
-      const stageName=STAGE_NAMES[opp.pipelineStageId]||opp.pipelineStageId||'';
-      const name=opp.name||opp.contact?.name||'Unknown';
-      const salesRep=await getSalesRep(oppFields,contactFields,opp);
-
-      if(!date){
-        // Check if this opp matches a calendar appointment — if so, use that date
-        let calDate=null;
-        let calCrew=null;
-        for(const appt of allAppointments){
-          if(namesMatch(name,appt.name)){
-            calDate=appt.date;
-            calCrew=appt.crew;
-            break;
-          }
-        }
-        if(calDate){
-          // Found a matching calendar appointment — use that date
-          if(!byDate[calDate])byDate[calDate]={date:calDate,revenue:0,jobs:[],count:0};
-          byDate[calDate].revenue+=revenue;
-          byDate[calDate].count++;
-          byDate[calDate].jobs.push({
-            name,revenue,salesRep,
-            pending:revenue<=0,
-            pipeline:pipelineName,
-            stage:stageName,
-            source:'calendar-matched',
-            normalizedName:normalizeName(name)
-          });
-        }else{
-          noDateList.push({name,revenue,pipeline:pipelineName,stage:stageName,salesRep});
-        }
-        continue;
-      }
-
-      if(!byDate[date])byDate[date]={date,revenue:0,jobs:[],count:0};
-      byDate[date].revenue+=revenue;
-      byDate[date].count++;
-      byDate[date].jobs.push({
-        name,revenue,salesRep,
-        pending:revenue<=0,
-        pipeline:pipelineName,
-        stage:stageName,
-        source:'opportunity',
-        normalizedName:normalizeName(name)
-      });
+    // If cache is stale but exists, serve it AND refresh in background
+    if(!force&&calendarCache.data){
+      res.json({...calendarCache.data,cached:true,stale:true,cacheAgeSec:Math.round(age/1000)});
+      refreshCacheInBackground();
+      return;
     }
 
-    // Add calendar appointments that have no matching opportunity at all
-    for(const appt of allAppointments){
-      const {date,name,crew}=appt;
-      if(!byDate[date]){byDate[date]={date,revenue:0,jobs:[],count:0};}
-      // Check if already covered by an opportunity (by name match)
-      const alreadyExists=byDate[date].jobs.some(j=>namesMatch(j.name,name));
-      if(alreadyExists)continue;
-      byDate[date].count++;
-      byDate[date].jobs.push({
-        name,revenue:0,salesRep:crew,
-        pending:true,
-        pipeline:'Crew Calendar',
-        stage:crew,
-        source:'calendar',
-        normalizedName:normalizeName(name)
-      });
-    }
-
-    res.json({
-      success:true,
-      data:Object.values(byDate).sort((a,b)=>a.date.localeCompare(b.date)),
-      noDateList:noDateList.sort((a,b)=>b.revenue-a.revenue)
-    });
+    // No cache yet — build fresh
+    const data=await buildCalendarData();
+    calendarCache={data,timestamp:Date.now()};
+    res.json({...data,cached:false});
   }catch(e){console.error(e);res.status(500).json({error:e.message});}
+});
+
+// Manual force refresh
+app.get('/api/refresh',async(req,res)=>{
+  try{
+    const data=await buildCalendarData();
+    calendarCache={data,timestamp:Date.now()};
+    res.json({success:true,refreshedAt:new Date().toISOString()});
+  }catch(e){res.status(500).json({error:e.message});}
 });
 
 // DEBUG endpoint
@@ -459,7 +538,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   </div>
   <div class="grid" id="calGrid"><div class="loading" style="grid-column:span 7"><div class="spinner"></div>Loading jobs...</div></div>
 </div>
-<div class="refresh-note" id="refreshNote">Refreshes every 30 minutes</div>
+<div class="refresh-note" id="refreshNote">Refreshes every 5 minutes</div>
 
 <div class="no-date-section" id="noDateSection" style="display:none">
   <div class="no-date-header">
@@ -521,7 +600,7 @@ async function loadData(){
     maxRev=Math.max(...d.data.map(x=>x.revenue),1);
     noDateData=d.noDateList||[];
     lastLoaded=new Date();
-    updateRefreshNote();
+    updateRefreshNote(d.cached,d.cacheAgeSec);
     renderCalendar();
     renderNoDateList();
   }catch(e){
@@ -548,10 +627,12 @@ function renderNoDateList(){
   body.innerHTML=html;
 }
 
-function updateRefreshNote(){
+function updateRefreshNote(cached,ageSec){
   if(!lastLoaded)return;
   var t=lastLoaded.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
-  document.getElementById('refreshNote').textContent='Last updated: '+t+' · Refreshes every 30 min';
+  var note='Last updated: '+t+' · Refreshes every 5 min';
+  if(cached&&ageSec!==undefined)note+=' · ⚡ cached ('+ageSec+'s old)';
+  document.getElementById('refreshNote').textContent=note;
 }
 
 function getDayLimit(dateStr){
@@ -691,9 +772,14 @@ function closeModal(e){
 }
 
 loadData();
-setInterval(loadData,30*60*1000);
+setInterval(loadData,5*60*1000);
 </script>
 </body></html>`);
 });
 
-app.listen(PORT,'0.0.0.0',()=>console.log('Revenue Calendar running on port '+PORT));
+// Warm the cache on startup so first user load is fast
+app.listen(PORT,'0.0.0.0',()=>{
+  console.log('Revenue Calendar running on port '+PORT);
+  console.log('Warming cache...');
+  refreshCacheInBackground();
+});
